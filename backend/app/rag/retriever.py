@@ -1,4 +1,5 @@
 """检索：混合检索（向量 + BM25，RRF 融合）+ 重排序（gte-rerank）。"""
+import threading
 from typing import List
 
 from langchain_community.retrievers import BM25Retriever
@@ -9,6 +10,9 @@ from app.rag.vectorstore import get_vectorstore
 
 # 每个知识库的 BM25 索引缓存（文档增删后失效）
 _bm25_cache: dict[int, BM25Retriever] = {}
+
+# chromadb 的 PersistentClient 非线程安全，串行化检索避免并发死锁（压测优化）
+_retrieval_lock = threading.Lock()
 
 
 def invalidate_bm25(kb_id: int) -> None:
@@ -52,6 +56,8 @@ def _rrf_merge(vec_docs: List[Document], bm25_docs: List[Document], k: int = 60)
 
 def _rerank(query: str, docs: List[Document], top_n: int) -> List[tuple]:
     """百炼 gte-rerank 重排序，返回 [(doc, relevance_score)]。"""
+    if settings.MOCK_LLM:
+        return [(d, 0.0) for d in docs[:top_n]]
     from dashscope import TextReRank
 
     try:
@@ -80,42 +86,45 @@ def retrieve(
     kb_id: int, query: str, top_k: int | None = None, query_embedding=None
 ) -> List[dict]:
     """返回引用列表 [{content, source, score, doc_id, chunk_index}]。"""
-    top_k = top_k or settings.RETRIEVAL_TOP_K
-    vectorstore = get_vectorstore(kb_id)
+    with _retrieval_lock:  # 串行化，避免 chromadb 并发死锁
+        top_k = top_k or settings.RETRIEVAL_TOP_K
+        vectorstore = get_vectorstore(kb_id)
 
-    if query_embedding is not None:
-        vec_docs = vectorstore.similarity_search_by_vector(
-            query_embedding, k=max(top_k * 3, 10)
-        )
-    else:
-        vec_hits = vectorstore.similarity_search_with_score(query, k=max(top_k * 3, 10))
-        vec_docs = [d for d, _ in vec_hits]
+        if query_embedding is not None:
+            vec_docs = vectorstore.similarity_search_by_vector(
+                query_embedding, k=max(top_k * 3, 10)
+            )
+        else:
+            vec_hits = vectorstore.similarity_search_with_score(
+                query, k=max(top_k * 3, 10)
+            )
+            vec_docs = [d for d, _ in vec_hits]
 
-    bm25_docs: List[Document] = []
-    if settings.HYBRID_ENABLED:
-        bm25 = _get_bm25(kb_id, vectorstore)
-        if bm25:
-            bm25_docs = bm25.invoke(query)
+        bm25_docs: List[Document] = []
+        if settings.HYBRID_ENABLED:
+            bm25 = _get_bm25(kb_id, vectorstore)
+            if bm25:
+                bm25_docs = bm25.invoke(query)
 
-    ranked = _rrf_merge(vec_docs, bm25_docs)
+        ranked = _rrf_merge(vec_docs, bm25_docs)
 
-    if settings.RERANK_ENABLED and len(ranked) > top_k:
-        pairs = _rerank(query, [d for d, _ in ranked], top_k)
-        final = [{"doc": d, "score": round(s, 4)} for d, s in pairs]
-    else:
-        final = [{"doc": d, "score": round(s, 4)} for d, s in ranked[:top_k]]
+        if settings.RERANK_ENABLED and len(ranked) > top_k:
+            pairs = _rerank(query, [d for d, _ in ranked], top_k)
+            final = [{"doc": d, "score": round(s, 4)} for d, s in pairs]
+        else:
+            final = [{"doc": d, "score": round(s, 4)} for d, s in ranked[:top_k]]
 
-    citations = []
-    for item in final:
-        doc = item["doc"]
-        meta = doc.metadata or {}
-        citations.append(
-            {
-                "content": doc.page_content,
-                "source": meta.get("source", "未知来源"),
-                "score": item["score"],
-                "doc_id": meta.get("doc_id"),
-                "chunk_index": meta.get("chunk_index"),
-            }
-        )
-    return citations
+        citations = []
+        for item in final:
+            doc = item["doc"]
+            meta = doc.metadata or {}
+            citations.append(
+                {
+                    "content": doc.page_content,
+                    "source": meta.get("source", "未知来源"),
+                    "score": item["score"],
+                    "doc_id": meta.get("doc_id"),
+                    "chunk_index": meta.get("chunk_index"),
+                }
+            )
+        return citations

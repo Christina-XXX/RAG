@@ -4,6 +4,8 @@ from collections import defaultdict, deque
 
 from fastapi import HTTPException, Request
 
+from app.config import settings
+
 
 class SimpleRateLimiter:
     def __init__(self, limit: int = 30, window: int = 60):
@@ -12,6 +14,8 @@ class SimpleRateLimiter:
         self._hits: dict[str, deque] = defaultdict(deque)
 
     def __call__(self, request: Request):
+        if settings.MOCK_LLM:
+            return  # 压测模式跳过限流，避免掩盖真实瓶颈
         key = request.client.host if request.client else "unknown"
         now = time.time()
         q = self._hits[key]

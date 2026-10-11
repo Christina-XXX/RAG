@@ -30,6 +30,14 @@ def _chunk_text(text: str, size: int = 12) -> list[str]:
     return [text[i : i + size] for i in range(0, len(text), size)]
 
 
+def _mock_answer(question: str) -> str:
+    """压测模式的模拟回答（零网络、零费用）。"""
+    return (
+        f"这是压测模式的模拟回答哦～关于「{question[:20]}」，"
+        "根据知识库资料 [1]，相关信息已为你整理完毕，详情请以页面为准～"
+    )
+
+
 def _get_or_create_conversation(db, user_id: int, conversation_id: int | None) -> Conversation:
     if conversation_id:
         conv = (
@@ -92,7 +100,7 @@ async def chat_stream(user_id: int, conversation_id: int | None, message: str):
         try:
             # 查询改写（指代消解）
             query = message
-            if settings.QUERY_REWRITE_ENABLED and history_rows:
+            if settings.QUERY_REWRITE_ENABLED and not settings.MOCK_LLM and history_rows:
                 query = await asyncio.to_thread(rewrite_query, history_str, message)
 
             # 单次 query 向量化，供语义缓存 + 向量检索复用
@@ -132,14 +140,21 @@ async def chat_stream(user_id: int, conversation_id: int | None, message: str):
 
             citations = await asyncio.to_thread(_do_retrieve)
             context = build_context(citations)
-            chain = get_chain()
 
             answer_parts: list[str] = []
-            async for chunk in chain.astream(
-                {"history": history_str, "context": context, "question": message}
-            ):
-                answer_parts.append(chunk)
-                yield _sse("delta", {"content": chunk})
+            if settings.MOCK_LLM:
+                for piece in _chunk_text(_mock_answer(message), size=4):
+                    answer_parts.append(piece)
+                    yield _sse("delta", {"content": piece})
+                    if settings.MOCK_LLM_DELAY_MS > 0:
+                        await asyncio.sleep(settings.MOCK_LLM_DELAY_MS / 1000)
+            else:
+                chain = get_chain()
+                async for chunk in chain.astream(
+                    {"history": history_str, "context": context, "question": message}
+                ):
+                    answer_parts.append(chunk)
+                    yield _sse("delta", {"content": chunk})
 
             answer = "".join(answer_parts)
             sources = parse_citations(answer, citations)

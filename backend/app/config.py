@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     QUERY_REWRITE_ENABLED: bool = True
     SEMANTIC_CACHE_ENABLED: bool = True
 
+    # 压测/离线模式：true 时向量化、LLM、重排序全部本地模拟（零费用、无网络）
+    MOCK_LLM: bool = False
+    MOCK_LLM_DELAY_MS: int = 30  # 模拟 LLM 每个分块的延迟（毫秒）
+
     # CORS
     CORS_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173"
 
